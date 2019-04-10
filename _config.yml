@@ -12,7 +12,7 @@ github_repo: "https://github.com/huhaipeng/huhaipeng.github.io.git" # you code r
 # Sidebar settings
 sidebar: true                           # whether or not using Sidebar.
 sidebar-about-description: "Goals determine what you going to be!"
-sidebar-avatar: /img/post-bg-hacker.jpg     # use absolute URL, seeing it's used in both `/` and `/about/`
+sidebar-avatar: /img/gakki.jpg     # use absolute URL, seeing it's used in both `/` and `/about/`
 
 
 
