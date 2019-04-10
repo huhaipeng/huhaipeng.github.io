@@ -3,7 +3,7 @@ layout:     post
 title:      从一道网易面试题浅谈 Tagged Pointer
 subtitle:   浅谈 Tagged Pointer
 date:       2018-12-26
-author:     BY
+author:     HHP
 header-img: img/post-bg-universe.jpg
 catalog: true
 tags:
@@ -13,7 +13,7 @@ tags:
 
 ## 前言
 
-这篇博客九月就想写了，因为赶项目拖了到现在，抓住17年尾巴写吧~
+这篇博客九月就想写了，因为赶项目拖了到现在，抓住18年尾巴写吧~
 
 
 ## 正文
