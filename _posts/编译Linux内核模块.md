@@ -1,0 +1,444 @@
+---
+layout:     post
+title:      linux内核模块的交叉编译和加载
+subtitle:   
+date:       2019-5-6
+author:     HHP
+header-img: img/post-bg-unix-linux.jpg
+catalog: true
+tags:
+    - linux  
+    - kernel
+    - cross compile
+---
+
+### 前言
+
+本文的重点不是去讲解如何去编写一个内核模块，而是编写好一个内核模块应该怎么（交叉）编译和加载进内核。
+
+### 背景
+
+本人在编译和加载内核模块的时候踩过不少坑。当中很多坑都是在交叉编译的时候遇到的。所以借此文记录一下，也可供以后查看。
+
+* 首先，我编写一个叫globalfifo的模块，下面是我的c源码:
+
+```c
+#include <linux/module.h>
+#include <linux/types.h>
+#include <linux/sched.h>
+#include <linux/init.h>
+#include <linux/cdev.h>
+#include <linux/slab.h>
+#include <linux/poll.h>
+#include <linux/platform_device.h>
+#include <linux/miscdevice.h>
+#include <linux/of_device.h>
+//#include <linux/sched/signal.h>
+#define GLOBALFIFO_SIZE	0x1000
+#define FIFO_CLEAR 0x1
+#define GLOBALFIFO_MAJOR 231
+
+struct globalfifo_dev {
+	struct cdev cdev;
+	unsigned int current_len;
+	unsigned char mem[GLOBALFIFO_SIZE];
+	struct mutex mutex;
+	wait_queue_head_t r_wait;
+	wait_queue_head_t w_wait;
+	struct fasync_struct *async_queue;
+	struct miscdevice miscdev;
+};
+
+static int globalfifo_fasync(int fd, struct file *filp, int mode)
+{
+	struct globalfifo_dev *dev = container_of(filp->private_data,
+		struct globalfifo_dev, miscdev);
+
+	return fasync_helper(fd, filp, mode, &dev->async_queue);
+}
+
+static int globalfifo_open(struct inode *inode, struct file *filp)
+{
+       return 0;
+}
+
+static int globalfifo_release(struct inode *inode, struct file *filp)
+{
+	globalfifo_fasync(-1, filp, 0);
+	return 0;
+}
+
+static long globalfifo_ioctl(struct file *filp, unsigned int cmd,
+			     unsigned long arg)
+{
+	struct globalfifo_dev *dev = container_of(filp->private_data,
+		struct globalfifo_dev, miscdev);
+
+	switch (cmd) {
+	case FIFO_CLEAR:
+		mutex_lock(&dev->mutex);
+		dev->current_len = 0;
+		memset(dev->mem, 0, GLOBALFIFO_SIZE);
+		mutex_unlock(&dev->mutex);
+
+		printk(KERN_INFO "globalfifo is set to zero\n");
+		break;
+
+	default:
+		return -EINVAL;
+	}
+	return 0;
+}
+
+static unsigned int globalfifo_poll(struct file *filp, poll_table * wait)
+{
+	unsigned int mask = 0;
+	struct globalfifo_dev *dev = container_of(filp->private_data,
+		struct globalfifo_dev, miscdev);
+
+	mutex_lock(&dev->mutex);
+
+	poll_wait(filp, &dev->r_wait, wait);
+	poll_wait(filp, &dev->w_wait, wait);
+
+	if (dev->current_len != 0) {
+		mask |= POLLIN | POLLRDNORM;
+	}
+
+	if (dev->current_len != GLOBALFIFO_SIZE) {
+		mask |= POLLOUT | POLLWRNORM;
+	}
+
+	mutex_unlock(&dev->mutex);
+	return mask;
+}
+
+static ssize_t globalfifo_read(struct file *filp, char __user *buf,
+			       size_t count, loff_t *ppos)
+{
+	int ret;
+	struct globalfifo_dev *dev = container_of(filp->private_data,
+		struct globalfifo_dev, miscdev);
+
+	DECLARE_WAITQUEUE(wait, current);
+
+	mutex_lock(&dev->mutex);
+	add_wait_queue(&dev->r_wait, &wait);
+
+	while (dev->current_len == 0) {
+		if (filp->f_flags & O_NONBLOCK) {
+			ret = -EAGAIN;
+			goto out;
+		}
+		__set_current_state(TASK_INTERRUPTIBLE);
+		mutex_unlock(&dev->mutex);
+
+		schedule();
+
+		mutex_lock(&dev->mutex);
+	}
+
+	if (count > dev->current_len)
+		count = dev->current_len;
+
+	if (copy_to_user(buf, dev->mem, count)) {
+		ret = -EFAULT;
+		goto out;
+	} else {
+		memcpy(dev->mem, dev->mem + count, dev->current_len - count);
+		dev->current_len -= count;
+		printk(KERN_INFO "read %d bytes(s),current_len:%d\n", count,
+		       dev->current_len);
+
+		wake_up_interruptible(&dev->w_wait);
+
+		ret = count;
+	}
+ out:
+	mutex_unlock(&dev->mutex);
+ out2:
+	remove_wait_queue(&dev->r_wait, &wait);
+	set_current_state(TASK_RUNNING);
+	return ret;
+}
+
+static ssize_t globalfifo_write(struct file *filp, const char __user *buf,
+				size_t count, loff_t *ppos)
+{
+	struct globalfifo_dev *dev = container_of(filp->private_data,
+		struct globalfifo_dev, miscdev);
+
+	int ret;
+	DECLARE_WAITQUEUE(wait, current);
+
+	mutex_lock(&dev->mutex);
+	add_wait_queue(&dev->w_wait, &wait);
+
+	while (dev->current_len == GLOBALFIFO_SIZE) {
+		if (filp->f_flags & O_NONBLOCK) {
+			ret = -EAGAIN;
+			goto out;
+		}
+		__set_current_state(TASK_INTERRUPTIBLE);
+
+		mutex_unlock(&dev->mutex);
+
+		schedule();
+//		if (signal_pending(current)) {
+//			ret = -ERESTARTSYS;
+//			goto out2;
+//		}
+
+		mutex_lock(&dev->mutex);
+	}
+
+	if (count > GLOBALFIFO_SIZE - dev->current_len)
+		count = GLOBALFIFO_SIZE - dev->current_len;
+
+	if (copy_from_user(dev->mem + dev->current_len, buf, count)) {
+		ret = -EFAULT;
+		goto out;
+	} else {
+		dev->current_len += count;
+		printk(KERN_INFO "written %d bytes(s),current_len:%d\n", count,
+		       dev->current_len);
+
+		wake_up_interruptible(&dev->r_wait);
+
+		if (dev->async_queue) {
+			kill_fasync(&dev->async_queue, SIGIO, POLL_IN);
+			printk(KERN_DEBUG "%s kill SIGIO\n", __func__);
+		}
+
+		ret = count;
+	}
+
+ out:
+	mutex_unlock(&dev->mutex);
+ out2:
+	remove_wait_queue(&dev->w_wait, &wait);
+	set_current_state(TASK_RUNNING);
+	return ret;
+}
+
+static const struct file_operations globalfifo_fops = {
+	.owner = THIS_MODULE,
+	.read = globalfifo_read,
+	.write = globalfifo_write,
+	.unlocked_ioctl = globalfifo_ioctl,
+	.poll = globalfifo_poll,
+	.fasync = globalfifo_fasync,
+	.open = globalfifo_open,
+	.release = globalfifo_release,
+};
+
+static int globalfifo_probe(struct platform_device *pdev)
+{
+	struct globalfifo_dev *gl;
+	int ret;
+
+	gl = devm_kzalloc(&pdev->dev, sizeof(*gl), GFP_KERNEL);
+	if (!gl)
+		return -ENOMEM;
+	gl->miscdev.minor = MISC_DYNAMIC_MINOR;
+	gl->miscdev.name = "globalfifo";
+	gl->miscdev.fops = &globalfifo_fops;
+
+	mutex_init(&gl->mutex);
+	init_waitqueue_head(&gl->r_wait);
+	init_waitqueue_head(&gl->w_wait);
+	platform_set_drvdata(pdev, gl);
+
+	ret = misc_register(&gl->miscdev);
+	if (ret < 0)
+		goto err;
+
+	dev_info(&pdev->dev, "globalfifo drv probed\n");
+	return 0;
+err:
+	return ret;
+}
+
+static int globalfifo_remove(struct platform_device *pdev)
+{
+	struct globalfifo_dev *gl = platform_get_drvdata(pdev);
+
+	misc_deregister(&gl->miscdev);
+
+	dev_info(&pdev->dev, "globalfifo drv removed\n");
+	return 0;
+}
+
+static struct platform_driver globalfifo_driver = {
+	.driver = {
+		.name = "globalfifo",
+		.owner = THIS_MODULE,
+	},
+	.probe = globalfifo_probe,
+	.remove = globalfifo_remove,
+};
+
+module_platform_driver(globalfifo_driver);
+
+MODULE_AUTHOR("Barry Song <baohua@kernel.org>");
+MODULE_LICENSE("GPL v2");
+
+```
+
+
+
+
+
+
+
+* 然后就写Makefile啦~，在google上看到的大多数内核模块的makefile模板都是长这样的：
+
+```makefile
+KVERS = $(shell uname -r)
+
+# Kernel modules
+obj-m += globalfifo.o globalfifo-dev.o
+
+# Specify flags for the module compilation.
+EXTRA_CFLAGS=-g -O0
+
+build: kernel_modules
+
+kernel_modules:
+        make -C /lib/modules/$(KVERS)/build M=$(CURDIR) modules
+
+clean:
+        make -C /lib/modules/$(KVERS)/build M=$(CURDIR) clean
+```
+
+稍微解释一下一些关键的地方，`obj-m`就是以模块形式编译我们的代码。` make -C /lib/modules/$(KVERS)/build M=$(CURDIR) modules`中的意思是进入`-C`后面那个路径，读取那个路径下的Makefile，然后返回到`M=`后面的路径下进行编译。这里插一句，这个`/lib/modules/$(KVERS)/build`实际上是一个软链接，指向内核源码目录。这个一般发行版都会自带。如果没有的话，那就自己下载一个header package就好了。
+
+这个Makefile本身没有任何问题，如果是在本机编译本机加载的话，只要make一下就ok了，然后也能顺利insmod。但是如果是交叉编译的话这个makefile就有问题了。问题是`KVERS = $(shell uname -r)`这里的路径。这个路径是我们开发机的内核源码路径，而我们交叉编译的时候需要编译的内核模块对应的内核版本一般不是一样的，所以不能使用这个路径。所以应该针对我们板子上的内核版本来下载相应版本的内核源码下来，然后修改这个路径，这样就会到这个路径下面去读取内核源码的makefile和使用这个路径下的内核文件。比如说我板子上的内核版本是3.8.13，那我就下载linux3.8.13版本的源码下来，并修改这个makefile如下：
+
+```makefile
+KVERS = /home/huhaipeng/Desktop/linux-3.8.13
+
+# Kernel modules
+obj-m += globalfifo.o globalfifo-dev.o
+
+# Specify flags for the module compilation.
+EXTRA_CFLAGS=-g -O0
+
+build: kernel_modules
+
+kernel_modules:
+        make -C $(KVERS) M=$(CURDIR) modules
+
+clean:
+        make -C $(KVERS) M=$(CURDIR) clean
+```
+
+好，修改好了再试一下看行不行，会发现还是会有报错的。
+
+为什么还会报错呢？还有一个问题是出现在内核源码的Makefile里。
+
+内核源码的Makefile里有两行如下(ARCH和CROSS_COMPILE)：
+
+```makefile
+#
+# When performing cross compilation for other architectures ARCH shall be set
+# to the target architecture. (See arch/* for the possibilities).
+# ARCH can be set during invocation of make:
+# make ARCH=ia64
+# Another way is to have ARCH set in the environment.
+# The default ARCH is the host where make is executed.
+
+# CROSS_COMPILE specify the prefix used for all executables used
+# during compilation. Only gcc and related bin-utils executables
+# are prefixed with $(CROSS_COMPILE).
+# CROSS_COMPILE can be set on the command line
+# make CROSS_COMPILE=ia64-linux-
+# Alternatively CROSS_COMPILE can be set in the environment.
+# A third alternative is to store a setting in .config so that plain
+# "make" in the configured kernel build directory always uses that.
+# Default value for CROSS_COMPILE is not to prefix executables
+# Note: Some architectures assign CROSS_COMPILE in their arch/*/Makefile
+ARCH            ?= $(SUBARCH)
+CROSS_COMPILE   ?= $(CONFIG_CROSS_COMPILE:"%"=%)
+
+```
+
+makefile里的注释已经说的很清楚，交叉编译的时候应该修改ARCH和CROSS_COMPILE，不然采用默认值。所以这里我们还需要修改这两行变为:
+
+```makefile
+ARCH            ?= arm
+CROSS_COMPILE   ?= arm-linux-
+```
+
+好，这次再编译一下，可能还有报错，比如
+
+```shell
+In file included from <command-line>:0:0:
+/home/haley/Desktop/linux-3.8.13/include/linux/kconfig.h:4:32: fatal error: generated/autoconf.h: No such file or directory
+```
+
+为什么呢？上面报出缺少`generated/autoconf.h`这个文件（其实根据你步骤的不同可能会报缺少script或者其他头文件的错）。答案是这些文件在源码里面是没有的，这些是根据.config里的配置在编译的时候生成的中间头文件。所以我们要在下载的内核源目录里面这样做：
+
+1、准备一份可用的.config(比如板子原来的.config)
+
+2、执行`make menuconfig`,然后按以下步骤加载这份.config文件。
+
+
+
+3、之后再执行`make prepare`和`make scripts` 生成对应的头文件和脚本文件。会发现再源码目录下的include路径下面的config文件夹和generated文件夹多出了很多脚本文件和头文件（当然也可以直接make，编译整个内核）。
+
+
+
+最后，我们再次进入globalfifo的目录，执行make，正常来说应该是没问题可以编译成功的。
+
+好了，搞了这么多，终于成功编译好了。。。
+
+
+
+
+
+
+
+
+
+* 接下来就是加载到内核了
+
+  我们首先把编译好的模块拷贝到板子上，然后执行`insmod globalfifo.ko`。如果一切顺利，我们就能成功加载内核模块了。但也有可能不会这么顺利，有很大可能你会发现报这样的错：
+
+  ```shell
+  insmod error: inserting './globalfifo.ko': -1 Invalid module format"
+  ```
+
+  不用慌，打开dmesg看一下，你会找到想要的答案：
+
+
+
+原来是这个vermagic在作怪，这个vermagic是什么鬼？其实就是我们在加载内核模块的时候，会根据这个vermagic string来比对内核的vermagic string，如果不匹配的话就不会加载进内核。我就是踩了这个坑，我一开始在编译内核模块之前按其实已经在板子上用`uname -r`看过内核版本，是`3.8.13.16`。但是官方源码版本就只有3.8.13，并没有3.8.13.16，于是我就download了3.8.13的源码下来编译模块了。
+
+那可不可以修改这个vermagic呢？答案是肯定可以的。
+
+比如我，我的内核模块和板子上内核的vermagic的区别是3.8.13-FriendlyArm和3.8.13.16而已，那我只需要将`-FriendlyArm`改成`.16`就ok啦。一般来说，3.8.13这个是不会变的，他们定义在内核源码makefile的开头
+
+```makefile
+VERSION = 3
+PATCHLEVEL = 8
+SUBLEVEL = 13
+EXTRAVERSION =
+```
+
+然后找到`-FriendlyArm`出现的位置，它在.config里定义
+
+`CONFIG_LOCALVERSION="-FriendlyARM"`
+
+那我就把他设为空改成`CONFIG_LOCALVERSION=".16"`或者直接设为空然后设`EXTRAVERSION = .16`就好了。
+
+之后我们再重新执行`make prepare`和`make scripts`就好了。其实执行完这两条命令之后，再`include/config/kernel.release`文件和`include/generated/utsrelease.h`就会有我们的vermagic开头了。
+
+之后再编译一下我们的内核模块，`modinfo globalfifo.ko`一下，就会看到我们想要的vermagic了。
+
+
+
+
+
+ 
+
