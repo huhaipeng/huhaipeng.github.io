@@ -72,7 +72,20 @@ kgdb 是一个在 Linux 内核上提供完整的 gdb 调试器功能的补丁，
 
 1、编译需要进行调试的linux内核代码。
 
-* 进入linux源码目录，先执行`make defconfig`生成默认.config文件（也可跳过这一步，直接`make menuconfig`），然后执行`make menuconfig`，选择自己需要的编译选项。最后需要勾选Kernel hacking-->Compiler-time checks and compiler options --->Compile the Kernel with debug info(不用内核版本选项名字可能稍有出入，但大致相同)，这一步 相当于我们平时运行gdb -g的效果，在生成的内核二进制中包含调试信息。
+* 进入linux源码目录，先执行
+
+  ```
+  make defconfig
+  ```
+
+  生成默认.config文件（也可跳过这一步，直接`make menuconfig`），然后执行
+
+  ```
+  make menuconfig
+  ```
+
+  选择自己需要的编译选项。最后需要勾选Kernel hacking-->Compiler-time checks and compiler options --->Compile the Kernel with debug info(不用内核版本选项名字可能稍有出入，但大致相同)，这一步 相当于我们平时运行gdb -g的效果，在生成的内核二进制中包含调试信息。
+
 * 保存之后执行编译（make && make install）。详细过程可参考 [linux内核入门]([https://huhaipeng.top/2018/08/11/linux%E5%85%A5%E9%97%A8/](https://huhaipeng.top/2018/08/11/linux入门/))。
 
 2、安装qemu
